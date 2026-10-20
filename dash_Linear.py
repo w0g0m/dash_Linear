@@ -259,7 +259,7 @@ app.layout = html.Div([
                                         options=[
                                             {"label": "補完なし", "value": "none"},
                                             {"label": "中央値/最頻値", "value": "median_mode"},
-                                            {"label": "線形補間/「欠損」埋め", "value": "iterative_missing"},
+                                            {"label": "線形モデル補間/「欠損」埋め", "value": "iterative_missing"},
                                         ],
                                         value="none",
                                         clearable=False,
@@ -511,7 +511,7 @@ def update_dynamic_tabs(n_clicks, stored_data, target_variables, class_variables
                 editable=False
             ),
             html.Div(id={"type": "wald-score", "index": target})],
-            style={"display": "block" if regression_method in ["quantile", "huber"] else "none"}
+            style={"display": "block" if regression_method in ["quantile", "huber"] else "none", "width": "45%", "height": "40vw"}
         )
         
         grid_search_graph = dcc.Graph(
@@ -718,19 +718,132 @@ def convert_percent_columns(df):
                     df[col] = converted_numeric
     return df
 
+
+class CategoricalMissingNormalizer(BaseEstimator, TransformerMixin):
+    """Dash/JSON経由でNoneになったカテゴリ欠損をnp.nanに統一する。"""
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if isinstance(X, pd.DataFrame):
+            return X.replace({None: np.nan, "": np.nan})
+        if isinstance(X, np.ndarray):
+            out = X.astype(object, copy=True)
+            out[pd.isna(out)] = np.nan
+            out[out == ""] = np.nan
+            return out
+        return X
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(input_features, dtype=object)
+
+
+class RareCategoryReplacer(BaseEstimator, TransformerMixin):
+    """学習データ全体で事前判定したレアカテゴリを、CV/予測データにも固定ルールで適用する。"""
+    def __init__(self, enabled=False, threshold=None, protected_category=None, fixed_rare_categories=None):
+        self.enabled = enabled
+        self.threshold = threshold
+        self.protected_category = protected_category
+        self.fixed_rare_categories = fixed_rare_categories
+        self.rare_category_map_ = {}
+        self.columns_ = None
+
+    def fit(self, X, y=None):
+        self.rare_category_map_ = {}
+        if isinstance(X, pd.DataFrame):
+            self.columns_ = list(X.columns)
+            for col in self.columns_:
+                # fixed_rare_categories が渡された場合、fold内では再判定しない。
+                # 判定元は encode_data() が学習データ全体から作成したマップ。
+                if self.enabled and self.fixed_rare_categories is not None:
+                    self.rare_category_map_[col] = list(self.fixed_rare_categories.get(col, []))
+                    continue
+
+                values = X[col].dropna()
+                threshold = self.threshold
+                if threshold is None:
+                    threshold = int(np.ceil(np.sqrt(len(X)) / 5))
+                if self.enabled and len(values):
+                    counts = values.value_counts(dropna=True)
+                    rare = counts[counts <= threshold].index.tolist()
+                    if self.protected_category in rare:
+                        rare.remove(self.protected_category)
+                    if len(rare) <= 1 or len(rare) == len(counts):
+                        rare = []
+                    self.rare_category_map_[col] = rare
+                else:
+                    self.rare_category_map_[col] = []
+        else:
+            self.columns_ = None
+        return self
+
+    def transform(self, X):
+        rare_map = getattr(self, "rare_category_map_", {})
+        if isinstance(X, pd.DataFrame):
+            X_out = X.copy()
+            for col, rare_cats in rare_map.items():
+                if col in X_out.columns and rare_cats:
+                    X_out[col] = X_out[col].mask(X_out[col].isin(rare_cats), "その他")
+            return X_out
+        return X
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(input_features, dtype=object)
+
+
+class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
+    """fold内で観測したカテゴリだけでOHE。基準カテゴリが存在しないfoldではdropしない。"""
+    def __init__(self, col_name=None, base_category=None, all_categories=None):
+        self.col_name = col_name
+        self.base_category = base_category
+        # all_categories は後方互換用。CVで全データ由来のカテゴリ一覧は使わない。
+        self.all_categories = all_categories
+        self.encoder_ = None
+        self.feature_names_out_ = None
+
+    def fit(self, X, y=None):
+        col_name = self.col_name or "cat"
+        probe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        probe.fit(X)
+        observed = list(probe.categories_[0])
+        drop = [self.base_category] if self.base_category in observed else None
+        self.encoder_ = OneHotEncoder(
+            categories=[observed], drop=drop, handle_unknown="ignore", sparse_output=False
+        )
+        self.encoder_.fit(X)
+        cleaned_names = []
+        for fn in self.encoder_.get_feature_names_out([col_name]):
+            suffix = fn[len(col_name) + 1:]
+            cleaned_names.append(f"{col_name}[{suffix}]")
+        self.feature_names_out_ = np.asarray(cleaned_names, dtype=object)
+        return self
+
+    def transform(self, X):
+        return self.encoder_.transform(X)
+
+    def get_feature_names_out(self, input_features=None):
+        return self.feature_names_out_
+
 class NumericPreprocessor:
-    def __init__(self, impute_method: str = "none", scale: bool = True):
+    def __init__(self, impute_method: str = "none", scale: bool = True, base_categories=None, rare_category_map=None, all_categories=None, rare_category_enabled=False):
         self.impute_method = impute_method
         self.scale = scale
+        self.base_categories = base_categories or {}
+        self.rare_category_map = rare_category_map or {}
+        self.all_categories = {}  # CVでは全データ由来のカテゴリ一覧を使わない
+        self.rare_category_enabled = rare_category_enabled
         self.column_transformer = None
         self.scaler = None
         self.is_df = False
         self.columns = None
         self.index = None
         self.feature_names_in_ = None
+        self.transformed_feature_names_ = None
         self.numeric_idx_ = []
         self.dummy_idx_ = []
         self.n_cols_ = 0
+        self.cat_cols_ = []
+        self.dummy_cols_ = []
 
     def fit(self, X, y=None):
         if X is None or (hasattr(X, 'shape') and X.shape[0] == 0):
@@ -741,27 +854,53 @@ class NumericPreprocessor:
             self.columns = list(X.columns)
             self.index = X.index
             self.feature_names_in_ = list(X.columns)
-            X_arr = np.asarray(X.values, dtype=float)
+            X_df = X.copy()
         else:
             self.columns = None
             self.index = None
-            self.feature_names_in_ = None
-            X_arr = np.asarray(X, dtype=float)
+            n_cols = X.shape[1] if len(X.shape) > 1 else 0
+            self.feature_names_in_ = [f"col_{i}" for i in range(n_cols)]
+            X_df = pd.DataFrame(X, columns=self.feature_names_in_)
 
-        n_cols = X_arr.shape[1] if len(X_arr.shape) > 1 else 0
-        self.n_cols_ = n_cols
+        cat_cols = []
+        dummy_cols = []
+        num_cols = []
+        for c in self.feature_names_in_:
+            if c in self.base_categories:
+                cat_cols.append(c)
+            elif "[" in str(c) and str(c).endswith("]"):
+                dummy_cols.append(c)
+            else:
+                if not pd.api.types.is_numeric_dtype(X_df[c]):
+                    cat_cols.append(c)
+                else:
+                    num_cols.append(c)
 
-        # 列名がある場合は列名からダミー列（"[" を含み "]" で終わる）を判定
-        if self.feature_names_in_ is not None:
-            numeric_idx = [i for i, c in enumerate(self.feature_names_in_) if not ("[" in str(c) and str(c).endswith("]"))]
-            dummy_idx = [i for i, c in enumerate(self.feature_names_in_) if ("[" in str(c) and str(c).endswith("]"))]
-        else:
-            numeric_idx = list(range(n_cols))
-            dummy_idx = []
+        # カテゴリ列は元データが整数dtype（例: 1, 2, 3）でも、
+        # iterative_missing では文字列「欠損」を補完値として使う。
+        # pandasの整数dtypeのままだと SimpleImputer が文字列を代入できず、
+        # fit時または予測transform時に dtype cast エラーになるため、
+        # fit/transformで同じ列をobject dtypeにそろえる。
+        self.cat_cols_ = list(cat_cols)
+        self.dummy_cols_ = list(dummy_cols)
+        for c in self.cat_cols_:
+            X_df[c] = X_df[c].astype(object)
+        # One-hot列は欠損補完の対象としてfloatに統一する。
+        # int64列にSimpleImputer(fill_value=0)がfloat値を渡す環境で発生する
+        # 「filling value float64 cannot be cast to int64」を防ぐ。
+        for c in dummy_cols:
+            X_df[c] = pd.to_numeric(X_df[c], errors="coerce").astype(float)
+
+        if self.impute_method == "none" and num_cols and X_df[num_cols].isna().any().any():
+            missing_cols = [c for c in num_cols if X_df[c].isna().any()]
+            raise ValueError(
+                "補完なしでは数値説明変数の欠損値を扱えません。欠損のある列: " + ", ".join(map(str, missing_cols))
+                + "。欠損値補完を選択するか、欠損行を除外してください。"
+            )
 
         transformers = []
 
-        if numeric_idx:
+        if num_cols:
             if self.impute_method in ["median", "median_mode"]:
                 num_imp = SimpleImputer(strategy="median")
             elif self.impute_method in ["linear", "iterative_missing"]:
@@ -783,9 +922,9 @@ class NumericPreprocessor:
             num_steps = [("imputer", num_imp)]
             if self.scale:
                 num_steps.append(("scaler", RobustScaler()))
-            transformers.append(("numeric", Pipeline(num_steps), numeric_idx))
+            transformers.append(("numeric", Pipeline(num_steps), num_cols))
 
-        if dummy_idx:
+        if dummy_cols:
             if self.impute_method in ["median_mode", "mode"]:
                 dummy_imp = SimpleImputer(strategy="most_frequent")
             elif self.impute_method in ["iterative_missing", "missing"]:
@@ -794,13 +933,56 @@ class NumericPreprocessor:
                 dummy_imp = SimpleImputer(strategy="constant", fill_value=0)
             else:
                 dummy_imp = FunctionTransformer()
-            transformers.append(("dummy", Pipeline([("imputer", dummy_imp)]), dummy_idx))
+            transformers.append(("dummy", Pipeline([("imputer", dummy_imp)]), dummy_cols))
+
+        for c in cat_cols:
+            if self.impute_method in ["iterative_missing", "missing"]:
+                cat_imp = SimpleImputer(strategy="constant", fill_value="欠損")
+            elif self.impute_method in ["median_mode", "mode"]:
+                cat_imp = SimpleImputer(strategy="most_frequent")
+            elif self.impute_method == "zero":
+                cat_imp = SimpleImputer(strategy="constant", fill_value="0")
+            else:
+                cat_imp = FunctionTransformer()
+
+            base_cat = self.base_categories.get(c, None)
+            all_cats = self.all_categories.get(c, None)
+            pipe = Pipeline([
+                ("normalize_missing", CategoricalMissingNormalizer()),
+                ("replacer", RareCategoryReplacer(
+                    enabled=self.rare_category_enabled,
+                    protected_category=self.base_categories.get(c),
+                    fixed_rare_categories=self.rare_category_map if self.rare_category_enabled else None
+                )),
+                ("imputer", cat_imp),
+                ("ohe", CustomOneHotEncoder(col_name=c, base_category=base_cat, all_categories=None))
+            ])
+            transformers.append((f"cat_{c}", pipe, [c]))
 
         if transformers:
             self.column_transformer = ColumnTransformer(transformers=transformers)
-            self.column_transformer.fit(X_arr)
+            self.column_transformer.fit(X_df)
+            final_names = []
+            for name, trans, cols in self.column_transformer.transformers_:
+                if name == "remainder":
+                    continue
+                try:
+                    final_names.extend(trans.get_feature_names_out(cols))
+                except Exception:
+                    # Numeric列は元の列名を維持。カテゴリ列はOHEの名前を使用。
+                    if name == "numeric":
+                        final_names.extend(list(cols))
+                    elif name == "dummy":
+                        final_names.extend(list(cols))
+                    else:
+                        try:
+                            final_names.extend(trans.named_steps["ohe"].get_feature_names_out(cols))
+                        except Exception:
+                            final_names.extend(list(cols))
+            self.transformed_feature_names_ = list(final_names)
         else:
             self.column_transformer = None
+            self.transformed_feature_names_ = list(self.feature_names_in_)
 
         class ProxyScaler:
             def __init__(self, center, scale):
@@ -808,22 +990,20 @@ class NumericPreprocessor:
                 self.scale_ = np.array(scale)
 
         num_scaler = None
-        if numeric_idx and self.scale and self.column_transformer is not None:
+        if num_cols and self.scale and self.column_transformer is not None:
             num_pipe = self.column_transformer.named_transformers_["numeric"]
             if "scaler" in num_pipe.named_steps:
                 num_scaler = num_pipe.named_steps["scaler"]
 
-        full_scale = [1.0] * n_cols
-        full_center = [0.0] * n_cols
-        for k, orig_i in enumerate(numeric_idx):
-            if num_scaler is not None:
-                full_scale[orig_i] = num_scaler.scale_[k]
-                full_center[orig_i] = num_scaler.center_[k]
+        full_scale = [1.0] * len(self.transformed_feature_names_)
+        full_center = [0.0] * len(self.transformed_feature_names_)
+        for k, col_name in enumerate(num_cols):
+            if num_scaler is not None and col_name in self.transformed_feature_names_:
+                idx = self.transformed_feature_names_.index(col_name)
+                full_scale[idx] = num_scaler.scale_[k]
+                full_center[idx] = num_scaler.center_[k]
 
         self.scaler = ProxyScaler(full_center, full_scale)
-        self.numeric_idx_ = numeric_idx
-        self.dummy_idx_ = dummy_idx
-
         return self
 
     def transform(self, X):
@@ -834,34 +1014,104 @@ class NumericPreprocessor:
         if is_df:
             cols = list(X.columns)
             idx = X.index
-            # 列名順序の照合: もし fit 時に列名があり、X にも同じ列が存在するなら列順を揃える
             if self.feature_names_in_ is not None and all(c in X.columns for c in self.feature_names_in_):
-                X_arr = np.asarray(X[self.feature_names_in_].values, dtype=float)
+                X_df = X[self.feature_names_in_]
+            elif (
+                self.feature_names_in_ is not None
+                and len(X.columns) == len(self.feature_names_in_)
+                and all(str(c).startswith("col_") for c in self.feature_names_in_)
+            ):
+                # 学習時にNumPy配列が渡されて col_0, col_1, ... と命名された旧経路との互換性。
+                # 列数が一致する場合に限り、予測入力を学習時の列順として扱う。
+                X_df = X.copy()
+                X_df.columns = self.feature_names_in_
             else:
-                X_arr = np.asarray(X.values, dtype=float)
+                missing = set(self.feature_names_in_ or []) - set(X.columns)
+                if missing:
+                    raise ValueError(f"予測データに学習時の説明変数がありません: {sorted(missing)}")
+                X_df = X
         else:
             cols = self.columns
             idx = None
-            X_arr = np.asarray(X, dtype=float)
+            X_df = pd.DataFrame(X, columns=self.feature_names_in_)
+
+        # fit時と同様にカテゴリ列のdtypeを統一する。特に整数カテゴリ列へ
+        # fill_value="欠損" を適用するケースで、fit/transform間のdtype不一致を防ぐ。
+        X_df = X_df.copy()
+        for c in getattr(self, "cat_cols_", []):
+            if c in X_df.columns:
+                X_df[c] = X_df[c].astype(object)
+        # fit()内でdummy列をfloatにしても、transform()には元のDataFrameが
+        # 再び渡されるため、ここでも同じdtype変換を行う必要がある。
+        # これをしないと SimpleImputer が学習時のfloatと入力時のint64の
+        # dtype不一致で失敗する。
+        for c in getattr(self, "dummy_cols_", []):
+            if c in X_df.columns:
+                X_df[c] = pd.to_numeric(X_df[c], errors="coerce").astype(float)
 
         if self.column_transformer is None:
-            X_res = X_arr
+            X_res = X_df.values
         else:
-            trans = self.column_transformer.transform(X_arr)
-            # ColumnTransformer が numeric_idx, dummy_idx の順に結合したものを元の列インデックス順に戻す
-            trans_order = self.numeric_idx_ + self.dummy_idx_
-            X_res = np.zeros_like(trans)
-            for new_j, orig_j in enumerate(trans_order):
-                X_res[:, orig_j] = trans[:, new_j]
+            X_res = self.column_transformer.transform(X_df)
 
         if is_df:
-            out_cols = self.feature_names_in_ if (self.feature_names_in_ is not None and len(self.feature_names_in_) == X_res.shape[1]) else cols
+            out_cols = self.transformed_feature_names_ if self.transformed_feature_names_ is not None else cols
             return pd.DataFrame(X_res, columns=out_cols, index=idx)
         else:
             return X_res
 
     def fit_transform(self, X, y=None):
         return self.fit(X, y).transform(X)
+
+
+def build_cv_feature_frame(raw_data, encoded_data, explanatory_variables):
+    """UI上の選択済み特徴量から、CV用の生カテゴリ列を復元したDataFrameを作る。
+
+    数値特徴量はそのまま、カテゴリのダミー列群は元のカテゴリ列1本に戻す。
+    これによりCV fold内でカテゴリ補完・レアカテゴリ統合・OHEをfitできる。
+    """
+    raw_df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data.get("data", []), columns=raw_data.get("columns"))
+    encoded_df = encoded_data if isinstance(encoded_data, pd.DataFrame) else pd.DataFrame(encoded_data.get("data", []), columns=encoded_data.get("columns"))
+    selected = []
+    for var in (explanatory_variables or []):
+        if var in raw_df.columns:
+            selected.append(var)
+            continue
+        if "[" in str(var) and str(var).endswith("]"):
+            base = str(var).split("[", 1)[0]
+            if base in raw_df.columns and not pd.api.types.is_numeric_dtype(raw_df[base]):
+                selected.append(base)
+                continue
+        if var in encoded_df.columns:
+            selected.append(var)
+    # 同じカテゴリ列のダミーが複数選ばれていても元列は一度だけ含める
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        return pd.DataFrame(index=encoded_df.index)
+    out = pd.DataFrame(index=encoded_df.index)
+    for col in selected:
+        if col in raw_df.columns and col not in encoded_df.columns:
+            out[col] = raw_df[col]
+        elif col in raw_df.columns and not pd.api.types.is_numeric_dtype(raw_df[col]):
+            out[col] = raw_df[col]
+        elif col in encoded_df.columns:
+            out[col] = encoded_df[col]
+        else:
+            out[col] = raw_df[col]
+    return out
+
+
+def transformed_feature_frame(preprocessor, X, index):
+    """fit済み前処理器がモデルへ渡す特徴量を、名前付きDataFrameで返す。"""
+    transformed = preprocessor.transform(X)
+    if isinstance(transformed, pd.DataFrame):
+        result = transformed.copy()
+        result.index = index
+        return result
+    names = getattr(preprocessor, "transformed_feature_names_", None)
+    if names is None or len(names) != np.asarray(transformed).shape[1]:
+        names = [f"feature_{i + 1}" for i in range(np.asarray(transformed).shape[1])]
+    return pd.DataFrame(np.asarray(transformed), columns=list(names), index=index)
 
 class ModelPipeline:
     def __init__(self, preprocessor, estimator, is_statsmodels=False, statsmodels_type=None, fit_params=None):
@@ -872,11 +1122,25 @@ class ModelPipeline:
         self.fit_params = fit_params or {}
         self.fitted_estimator_ = None
 
+    def _named_transformed(self, X_trans):
+        """変換後特徴量に前処理器が保持する実際の特徴量名を付ける。"""
+        names = getattr(self.preprocessor, "transformed_feature_names_", None)
+        if isinstance(X_trans, pd.DataFrame):
+            result = X_trans.copy()
+            if names is not None and len(names) == result.shape[1]:
+                result.columns = list(names)
+            return result
+        values = np.asarray(X_trans)
+        if names is None or len(names) != values.shape[1]:
+            names = [f"特徴量{i + 1}" for i in range(values.shape[1])]
+        return pd.DataFrame(values, columns=list(names))
+
     def fit(self, X, y):
         X_trans = self.preprocessor.fit_transform(X)
+        X_named = self._named_transformed(X_trans)
         if self.is_statsmodels:
             import statsmodels.api as sm
-            X_df = pd.DataFrame(X_trans)
+            X_df = X_named
             X_with_const = sm.add_constant(X_df, has_constant='add')
             if self.statsmodels_type == "huber":
                 t = self.fit_params.get("t", 1.345)
@@ -887,35 +1151,37 @@ class ModelPipeline:
                 model = sm.QuantReg(y, X_with_const)
                 self.fitted_estimator_ = model.fit(q=q, method="bootstrap")
             elif self.statsmodels_type == "firth":
-                self.fitted_estimator_ = firth_logistic_regression(X_trans, y, scale=False, balanced=True)
+                self.fitted_estimator_ = firth_logistic_regression(X_named, y, scale=False, balanced=True)
         else:
-            self.estimator.fit(X_trans, y)
+            self.estimator.fit(X_named, y)
             self.fitted_estimator_ = self.estimator
         return self
 
     def predict(self, X):
         X_trans = self.preprocessor.transform(X)
+        X_named = self._named_transformed(X_trans)
         if self.is_statsmodels:
             import statsmodels.api as sm
             if self.statsmodels_type in ["huber", "quantile"]:
-                X_df = pd.DataFrame(X_trans)
+                X_df = X_named
                 X_with_const = sm.add_constant(X_df, has_constant='add')
                 return self.fitted_estimator_.predict(X_with_const)
             elif self.statsmodels_type == "firth":
                 beta_hat = self.fitted_estimator_["coefficients"]
-                input_with_intercept = np.hstack([np.ones((X_trans.shape[0], 1)), X_trans])
+                input_with_intercept = np.hstack([np.ones((X_named.shape[0], 1)), X_named.to_numpy()])
                 eta = np.dot(input_with_intercept, beta_hat)
                 prob = expit(eta)
                 return prob
         else:
-            return self.fitted_estimator_.predict(X_trans)
+            return self.fitted_estimator_.predict(X_named)
 
     def predict_proba(self, X):
         X_trans = self.preprocessor.transform(X)
+        X_named = self._named_transformed(X_trans)
         if self.is_statsmodels and self.statsmodels_type == "firth":
             return self.predict(X)
         else:
-            return self.fitted_estimator_.predict_proba(X_trans)
+            return self.fitted_estimator_.predict_proba(X_named)
 
 def default_fig(title="", center_text=""):
     fig = go.Figure()
@@ -1658,13 +1924,11 @@ def encode_data(stored_data, rare_category_switch, dropdown_values, impute_metho
     # レアカテゴリ統合のために df をコピーして加工
     df_processed = df.copy()
 
-    # カテゴリ変数の欠損補完を適用（impute_methodがnone以外の場合に適用）
+    # カテゴリ変数の欠損補完:
+    # 欠損補完はCVリークを防ぐため各CV fold内のPipelineで実行する。
+    # ただし UI 表示・ダミー列用には "missing" / "iterative_missing" のとき "欠損" ラベルを適用可能。
     for col in df_category.columns:
-        if impute_method in ["median_mode", "mode"]:
-            if not df_processed[col].dropna().empty:
-                mode_val = df_processed[col].mode().iloc[0]
-                df_processed[col] = df_processed[col].fillna(mode_val)
-        elif impute_method in ["iterative_missing", "missing"]:
+        if impute_method in ["iterative_missing", "missing"]:
             df_processed[col] = df_processed[col].fillna("欠損")
 
     original_categories = {col: sorted(df[col].dropna().unique().tolist()) for col in df_category.columns}
@@ -1674,6 +1938,7 @@ def encode_data(stored_data, rare_category_switch, dropdown_values, impute_metho
     n_total = len(df)
     rare_threshold = int(np.ceil(np.sqrt(n_total) / 5))
     rare_category_map = {}
+    base_categories_map = {}
     
     for col in cat_summary_df["変数"]:
         if col == "__dummy__": 
@@ -1701,17 +1966,19 @@ def encode_data(stored_data, rare_category_switch, dropdown_values, impute_metho
             # dropなし One-hot → 0/1 を X/O に変換
             dummies = pd.get_dummies(df_processed[col], prefix="", prefix_sep="", drop_first=False)
             dummies.columns = [f"{col}[{c}]" for c in dummies.columns]
-            if impute_method == "none":
-                dummies.loc[df[col].isna(), :] = np.nan
+            dummies.loc[df[col].isna(), :] = np.nan
             dummies = dummies.replace({0: "X", 1: "O"})
             class_data = pd.concat([class_data, dummies], axis=1)
         elif option.startswith("説明変数(基準:"):
             # "説明変数(基準:○○)" の ○○ 部分だけ抜き出す
             base = option[8:-1]
+            base_categories_map[col] = base
             # drop-firstはアルファベット順で最初のカテゴリを落とすので、自作 drop をする
             dummies = pd.get_dummies(df_processed[col], prefix="", prefix_sep="", drop_first=False).astype(float)
             dummies.columns = [f"{col}[{c}]" for c in dummies.columns]
-            if impute_method == "none":
+            # 「線形モデル補完/欠損埋め」では、欠損を事前に「欠損」カテゴリへ置換済み。
+            # その行を全ダミーNaNに戻すと [欠損] が1にならないため、マスクしない。
+            if impute_method not in ["iterative_missing", "missing"]:
                 dummies.loc[df[col].isna(), :] = np.nan
             # 基準カテゴリ列だけ削除
             base_col = f"{col}[{base}]"
@@ -1728,13 +1995,23 @@ def encode_data(stored_data, rare_category_switch, dropdown_values, impute_metho
     else:
         impute_style = {"display": "none"}
     
+    # 既存の rare_category_map と base_categories を辞書にまとめて保存
+    rare_category_store_data = {
+        "rare_map": rare_category_map,
+        "base_cats": base_categories_map,
+        "enabled": bool(rare_category_switch)
+    }
+    # 後方互換のため、辞書直下にも各列の rare_cats を保持させる
+    for k, v in rare_category_map.items():
+        rare_category_store_data[k] = v
+
     return (
         {"data": num_data.to_dict("records"), "columns": list(num_data.columns)},
         {"data": class_data.to_dict("records"), "columns": list(class_data.columns)},
         {"data": label_data.to_dict("records"), "columns": list(label_data.columns)},
         impute_style,
         {"data": original_categories},
-        {"data": rare_category_map},
+        {"data": rare_category_store_data},
     )
 
 @app.callback(
@@ -2318,10 +2595,13 @@ def handle_variables(n_clicks_explanatory, n_clicks_target, n_clicks_class, stor
      State("target-variables", "value"),
      State("class-variables", "value"),
      State("regression-method", "value"),
-     State("impute-mode", "value")]
+     State("impute-mode", "value"),
+     State("store-original-categories", "data"),
+     State("store-rare-categories", "data"),
+     State("store-original-data", "data")]
 )
 def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_variables, target_variables, class_variables, 
-                     regression_method, impute_method):
+                     regression_method, impute_method, original_categories, rare_category_store, stored_original_data):
 
     total_variables = target_variables + class_variables
     
@@ -2329,8 +2609,19 @@ def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_varia
         return [{"target": target, "r2_scores": []} for target in total_variables], [default_fig("グリッドサーチ結果", "")] * len(total_variables)
     else:
         data = pd.DataFrame(stored_data["data"])
+        raw_df = pd.DataFrame(stored_original_data["data"], columns=stored_original_data["columns"]) if stored_original_data else data.copy()
+        cv_X_all = build_cv_feature_frame(raw_df, data, explanatory_variables)
         selected_data = data[explanatory_variables + target_variables]
         class_data = pd.concat([data[explanatory_variables], pd.DataFrame(stored_class_data["data"])], axis=1)
+
+        rare_category_map = {}
+        base_categories_map = {}
+        if rare_category_store and "data" in rare_category_store:
+            rdata = rare_category_store["data"]
+            rare_category_map = rdata.get("rare_map", rdata)
+            base_categories_map = rdata.get("base_cats", {})
+        all_categories_map = {}  # fold内の学習データからカテゴリを学習する
+        rare_category_enabled = bool(rare_category_store and rare_category_store.get("data", {}).get("enabled", False))
 
         if regression_method in ["quantile", "huber"]:
             return [
@@ -2356,7 +2647,7 @@ def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_varia
             # 回帰
             for target in target_variables:
                 dropped_data = selected_data.dropna(subset=[target])
-                X = dropped_data[explanatory_variables].values
+                X = cv_X_all.loc[dropped_data.index].copy()
                 y = dropped_data[target].values
                 r2_scores = np.zeros((len(alpha_values), len(l1_ratios)))
     
@@ -2366,11 +2657,18 @@ def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_varia
                 # ---- Foldごとに補完＆スケーリングをキャッシュ ----
                 fold_data = []
                 for train_idx, test_idx in kf.split(X):
-                    X_train, X_test = X[train_idx], X[test_idx]
+                    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
             
                     # 前処理
-                    preprocessor = NumericPreprocessor(impute_method)
+                    preprocessor = NumericPreprocessor(
+                        impute_method=impute_method,
+                        scale=True,
+                        base_categories=base_categories_map,
+                        rare_category_map=rare_category_map,
+                        all_categories=None,
+                        rare_category_enabled=rare_category_enabled
+                    )
                     X_train_processed = preprocessor.fit_transform(X_train)
                     X_test_processed = preprocessor.transform(X_test)
             
@@ -2422,7 +2720,7 @@ def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_varia
                 dropped_data = class_data.dropna(subset=[c_target])
                 dropped_data = dropped_data.copy()
                 dropped_data.loc[:, c_target] = dropped_data[c_target].map({"O": 1, "X": 0})
-                X = dropped_data[explanatory_variables].values
+                X = cv_X_all.loc[dropped_data.index].copy()
                 y = dropped_data[c_target].astype(int).values
                 r2_scores = np.zeros((len(alpha_values), len(l1_ratios)))
     
@@ -2433,11 +2731,18 @@ def perform_analysis(n_clicks, stored_data, stored_class_data, explanatory_varia
                 # ---- Foldごとに補完＆スケーリングをキャッシュ ----
                 fold_data = []
                 for train_idx, test_idx in kf.split(X, y):
-                    X_train, X_test = X[train_idx], X[test_idx]
+                    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
                 
                     # 欠損補完
-                    preprocessor = NumericPreprocessor(impute_method)
+                    preprocessor = NumericPreprocessor(
+                        impute_method=impute_method,
+                        scale=True,
+                        base_categories=base_categories_map,
+                        rare_category_map=rare_category_map,
+                        all_categories=None,
+                        rare_category_enabled=rare_category_enabled
+                    )
                     X_train_processed = preprocessor.fit_transform(X_train)
                     X_test_processed = preprocessor.transform(X_test)
                 
@@ -2558,11 +2863,15 @@ def update_sliders(click_data, r2_scores, regression_method):
      State("label-variables", "value"),
      State("regression-method", "value"),
      State("impute-mode", "value"),
-     State({"type": "test-table", "index": ALL}, "data")],
+           State({"type": "test-table", "index": ALL}, "data"),
+      State("store-original-categories", "data"),
+      State("store-rare-categories", "data"),
+      State("store-original-data", "data")],
     prevent_initial_call=True
 )
 def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, color_toggle, stored_data, stored_class_data, label_data,  
-                       explanatory_variables, target_variables, class_variables, label_variable, regression_method, impute_method, test_data):
+                       explanatory_variables, target_variables, class_variables, label_variable, regression_method, impute_method, test_data,
+                       original_categories, rare_category_store, stored_original_data):
     
     total_variables = target_variables + class_variables
     if stored_data is None or  (not target_variables and not class_variables):
@@ -2590,6 +2899,12 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
     
     try:
         data = pd.DataFrame(stored_data["data"])
+        raw_df = pd.DataFrame(stored_original_data["data"], columns=stored_original_data["columns"]) if stored_original_data else data.copy()
+        cv_X_all = build_cv_feature_frame(raw_df, data, explanatory_variables)
+        rare_store_data = rare_category_store.get("data", {}) if rare_category_store else {}
+        rare_category_enabled = bool(rare_store_data.get("enabled", False))
+        rare_category_map = rare_store_data.get("rare_map", {})
+        base_categories_map = rare_store_data.get("base_cats", {})
         class_data = pd.concat([data[explanatory_variables], pd.DataFrame(stored_class_data["data"])], axis=1)
         label_data = pd.DataFrame(label_data["data"]).fillna("データなし")
 
@@ -2616,7 +2931,7 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
         # 各目的変数に対して処理(回帰)
         for i, target in enumerate(target_variables):
             dropped_data = data.dropna(subset=[target])
-            X = dropped_data[explanatory_variables].values
+            X = dropped_data[explanatory_variables].copy()
             if explanatory_variables:
                 preprocessor = NumericPreprocessor(impute_method, scale=True)
                 X_scaled = preprocessor.fit_transform(X)
@@ -2856,15 +3171,26 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
                 fold_colors = generate_fold_colors(n_fold)
                 
                 df_oof = pd.DataFrame(index=data.index, columns=["fold", "y_true", "y_pred"])
-                
-                for fold, (train_idx, test_idx) in enumerate(kf.split(X)):
-                    X_train, X_test = X[train_idx], X[test_idx]
+                X_cv = cv_X_all.loc[dropped_data.index].copy()
+                for fold, (train_idx, test_idx) in enumerate(kf.split(X_cv)):
+                    X_train, X_test = X_cv.iloc[train_idx], X_cv.iloc[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
+                    test_index = dropped_data.index[test_idx]
 
-                    preprocessor_fold = NumericPreprocessor(impute_method, scale=True)
+                    preprocessor_fold = NumericPreprocessor(
+                        impute_method, scale=True,
+                        base_categories=base_categories_map,
+                        rare_category_map=rare_category_map,
+                        rare_category_enabled=rare_category_enabled
+                    )
                     pipeline_fold = ModelPipeline(preprocessor_fold, ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=0))
                     pipeline_fold.fit(X_train, y_train)
                     y_pred_fold = pipeline_fold.predict(X_test)
+                    fold_features = transformed_feature_frame(preprocessor_fold, X_test, test_index)
+                    for feature_name in fold_features.columns:
+                        if feature_name not in df_oof.columns:
+                            df_oof[feature_name] = np.nan
+                        df_oof.loc[test_index, feature_name] = fold_features[feature_name].values
                     all_y_test.extend(y_test)
                     all_y_pred.extend(y_pred_fold)
                     hovertemplate = (
@@ -2889,7 +3215,9 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
                 cv_figures.append(cv_fig)
                 
                 df_oof["行数"] = df_oof.index + 1
-                df_oof = df_oof[["行数", "fold", "y_true", "y_pred"]]
+                base_cols = ["行数", "fold", "y_true", "y_pred"]
+                feature_cols = [c for c in df_oof.columns if c not in base_cols]
+                df_oof = df_oof[base_cols + feature_cols]
                 cv_export_data.append(df_oof.to_dict("records"))
     
                 # 結果メッセージ
@@ -2914,7 +3242,7 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
             l1_ratio = l1_ratio_list[len(target_variables) + i] if len(l1_ratio_list) > len(target_variables) + i else 0.5
             dropped_data = class_data.dropna(subset=[c_target]).copy()
             dropped_data.loc[:, c_target] = dropped_data[c_target].map({"O": 1, "X": 0})
-            X = dropped_data[explanatory_variables].values
+            X = dropped_data[explanatory_variables].copy()
             y = dropped_data[c_target].astype(int).values
             threshold = threshold_list[total_variables.index(c_target)]
             preprocessor = NumericPreprocessor(impute_method, scale=True)
@@ -3042,19 +3370,31 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
                 cv_export_data.append([])
             else:
                 df_oof = pd.DataFrame(index=data.index, columns=["fold", "y_true", "y_pred"])
+                X_cv = cv_X_all.loc[dropped_data.index].copy()
                 min_class_count = np.min(np.bincount(y))
                 n_fold = int(np.floor(min(min_class_count, 10, 5 + 100 / np.sqrt(len(y)))))
                 kf = RepeatedStratifiedKFold(n_splits=n_fold, n_repeats=1, random_state=0)
                 fold_colors = generate_fold_colors(n_fold)
                 all_y_test, all_y_pred, all_y_proba = [], [], []
-                for fold, (train_idx, test_idx) in enumerate(kf.split(X, y)):
-                    X_train, X_test = X[train_idx], X[test_idx]
+                for fold, (train_idx, test_idx) in enumerate(kf.split(X_cv, y)):
+                    X_train, X_test = X_cv.iloc[train_idx], X_cv.iloc[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
+                    test_index = dropped_data.index[test_idx]
                 
-                    preprocessor_fold = NumericPreprocessor(impute_method, scale=True)
+                    preprocessor_fold = NumericPreprocessor(
+                        impute_method, scale=True,
+                        base_categories=base_categories_map,
+                        rare_category_map=rare_category_map,
+                        rare_category_enabled=rare_category_enabled
+                    )
                     pipeline_fold = ModelPipeline(preprocessor_fold, model)
                     pipeline_fold.fit(X_train, y_train)
                     cv_pred_proba = pipeline_fold.predict_proba(X_test)[:, 1]  # positive class の確率
+                    fold_features = transformed_feature_frame(preprocessor_fold, X_test, test_index)
+                    for feature_name in fold_features.columns:
+                        if feature_name not in df_oof.columns:
+                            df_oof[feature_name] = np.nan
+                        df_oof.loc[test_index, feature_name] = fold_features[feature_name].values
                     cv_pred_binary = (cv_pred_proba >= threshold).astype(int)
                     
                     y_labels = ["O" if val == 1 else "X" for val in y_test]
@@ -3085,7 +3425,9 @@ def update_elastic_net(tabs, log_alpha_list, l1_ratio_list, threshold_list, colo
                 
                 # DataFrame 化して export 用に保存
                 df_oof["行数"] = df_oof.index + 1
-                df_oof = df_oof[["行数", "fold", "y_true", "y_pred"]]
+                base_cols = ["行数", "fold", "y_true", "y_pred"]
+                feature_cols = [c for c in df_oof.columns if c not in base_cols]
+                df_oof = df_oof[base_cols + feature_cols]
                 cv_export_data.append(df_oof.to_dict("records"))
             
             # サブプロット作成
@@ -3308,7 +3650,7 @@ def run_wald_test(selected_rows, alpha, table_data, stored_data, stored_class_da
     else:
         raise ValueError(f"{target_variable} がどちらのデータにも存在しません")
 
-    X = df[explanatory_variables].values
+    X = df[explanatory_variables].copy()
     preprocessor = NumericPreprocessor(impute_method, scale=True)
     X_scaled = preprocessor.fit_transform(X)
     X_df = pd.DataFrame(X_scaled, columns=explanatory_variables)
@@ -3590,7 +3932,7 @@ def update_predictions(selected_tab, slider_values, explanatory_variables, targe
         for i, (target, alpha, l1_ratio, score) in enumerate(zip(target_variables, alpha_values, l1_ratio_values, saved_cv_scores)):
             # 回帰モデルを構築して予測値を計算
             dropped_data = data.dropna(subset=[target])
-            X = dropped_data[explanatory_variables].values
+            X = dropped_data[explanatory_variables].copy()
             y = dropped_data[target].values
             
             preprocessor = NumericPreprocessor(impute_method, scale=True)
@@ -3652,7 +3994,7 @@ def update_predictions(selected_tab, slider_values, explanatory_variables, targe
             # 分類モデルを構築して陽性確率を計算
             dropped_data = class_data.dropna(subset=[c_target]).copy()
             dropped_data.loc[:, c_target] = dropped_data[c_target].map({"O": 1, "X": 0})
-            X = dropped_data[explanatory_variables].values
+            X = dropped_data[explanatory_variables].copy()
             y = dropped_data[c_target].astype(int).values
             
             preprocessor = NumericPreprocessor(impute_method, scale=True)
@@ -3850,7 +4192,7 @@ def bulk_predict(contents, filename, explanatory_vars, target_variables, class_v
 
         def map_category(x):
             if pd.isna(x) or x is None or x == "":
-                return np.nan
+                return "欠損" if impute_mode in ["iterative_missing", "missing"] else np.nan
             s = str(x)
             # レアカテゴリの統合
             if len(rare_cats) >= 2 and s in rare_cats:
@@ -3895,7 +4237,7 @@ def bulk_predict(contents, filename, explanatory_vars, target_variables, class_v
 
         def process_cat_val(val):
             if pd.isna(val) or val is None or val == "":
-                return np.nan
+                return "欠損" if impute_mode in ["iterative_missing", "missing"] else np.nan
             s = str(val)
             if len(rare_cats) >= 2 and s in rare_cats:
                 return "その他"
@@ -3947,7 +4289,7 @@ def bulk_predict(contents, filename, explanatory_vars, target_variables, class_v
     # --- 回帰予測 ---
     for i, (target, alpha, l1_ratio) in enumerate(zip(target_variables, alpha_values, l1_ratio_values)):
         dropped = df_train.dropna(subset=[target])
-        X_train = dropped[explanatory_vars].values
+        X_train = dropped[explanatory_vars].copy()
         y_train = dropped[target].values
         
         preprocessor = NumericPreprocessor(impute_mode, scale=True)
@@ -3961,7 +4303,7 @@ def bulk_predict(contents, filename, explanatory_vars, target_variables, class_v
             pipeline = ModelPipeline(preprocessor, model)
             
         pipeline.fit(X_train, y_train)
-        pred = pipeline.predict(df_encoded.values)
+        pred = pipeline.predict(df_encoded)
         
         df_result[target] = pred
 
@@ -3970,18 +4312,18 @@ def bulk_predict(contents, filename, explanatory_vars, target_variables, class_v
         idx = len(target_variables) + j
         dropped = df_train.dropna(subset=[c_target])
         y_train = dropped[c_target].map({"O": 1, "X": 0}).astype(int).values
-        X_train = dropped[explanatory_vars].values
+        X_train = dropped[explanatory_vars].copy()
         
         preprocessor = NumericPreprocessor(impute_mode, scale=True)
         if regression_method in ["quantile", "huber"]:
             pipeline = ModelPipeline(preprocessor, estimator=None, is_statsmodels=True, statsmodels_type="firth")
             pipeline.fit(X_train, y_train)
-            prob = pipeline.predict_proba(df_encoded.values)
+            prob = pipeline.predict_proba(df_encoded)
         else:
             model = LogisticRegression(penalty="elasticnet", solver="saga", C=1/(10 ** alpha), l1_ratio=l1_ratio, random_state=0)
             pipeline = ModelPipeline(preprocessor, model)
             pipeline.fit(X_train, y_train)
-            prob = pipeline.predict_proba(df_encoded.values)[:, 1]
+            prob = pipeline.predict_proba(df_encoded)[:, 1]
             
         threshold = threshold_values[idx]
         df_result[c_target] = np.where(prob >= threshold, "O", "X")
